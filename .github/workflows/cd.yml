@@ -185,6 +185,7 @@ jobs:
           threading.Thread(target=sub.loop_forever, daemon=True).start()
 
           time.sleep(1)
+          
 
           pub = mqtt.Client()
           pub.connect("localhost", 1884, 60)
