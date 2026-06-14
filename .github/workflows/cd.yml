@@ -3,18 +3,37 @@ name: CD
 on:
   push:
     branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Release version tag (e.g. v1.0, v2.0)"
+        required: false
+        default: "v1.0"
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/bodaboda-app
 
 jobs:
   # ---------------------------------------------------------
-  # Run the same test suite before deploying anything
+  # STAGE 1: Run the full test suite (app + MQTT pub/sub test)
+  # If this fails, nothing below runs - pipeline stops here.
   # ---------------------------------------------------------
   test:
     name: Run Tests
     runs-on: ubuntu-latest
+
+    services:
+      mosquitto:
+        image: eclipse-mosquitto:2
+        ports:
+          - 1883:1883
+        options: >-
+          --health-cmd "mosquitto_pub -h localhost -t healthcheck -m ping || exit 1"
+          --health-interval 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -24,14 +43,26 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r backend/requirements.txt
+        run: |
+          pip install -r backend/requirements.txt
+          pip install paho-mqtt==1.6.1
+
+      - name: Configure Mosquitto for anonymous access
+        run: |
+          docker exec $(docker ps -q --filter ancestor=eclipse-mosquitto:2) sh -c \
+            "echo 'listener 1883' > /mosquitto/config/mosquitto.conf && \
+             echo 'allow_anonymous true' >> /mosquitto/config/mosquitto.conf" || true
 
       - name: Run tests
+        env:
+          MQTT_BROKER_HOST: localhost
+          MQTT_BROKER_PORT: 1883
         run: python -m pytest tests/ -v
 
   # ---------------------------------------------------------
-  # Build the Docker image and push to GitHub Container Registry
-  # Tags: latest + the git commit short SHA (e.g. v-<sha>)
+  # STAGE 2: Build Docker image, tag it, push to BOTH
+  # GitHub Container Registry AND Docker Hub
+  # Tags: latest, <commit-sha>, and version tag (e.g. v1.0)
   # ---------------------------------------------------------
   build-and-push:
     name: Build & Push Docker Image
@@ -44,16 +75,20 @@ jobs:
 
     outputs:
       image_tag: ${{ steps.meta.outputs.tag }}
-      image: ${{ steps.meta.outputs.image }}
+      version_tag: ${{ steps.meta.outputs.version }}
+      ghcr_image: ${{ steps.meta.outputs.ghcr_image }}
+      dockerhub_image: ${{ steps.meta.outputs.dockerhub_image }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set short SHA tag
+      - name: Compute image metadata
         id: meta
         run: |
           echo "tag=$(echo ${GITHUB_SHA} | cut -c1-7)" >> "$GITHUB_OUTPUT"
-          echo "image=$(echo ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "version=${{ inputs.version_tag || 'v1.0' }}" >> "$GITHUB_OUTPUT"
+          echo "ghcr_image=$(echo ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "dockerhub_image=$(echo ${{ env.DOCKERHUB_IMAGE }} | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -62,24 +97,42 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push image
+      - name: Build and push image to GHCR + Docker Hub
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: true
           tags: |
-            ${{ steps.meta.outputs.image }}:latest
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.ghcr_image }}:latest
+            ${{ steps.meta.outputs.ghcr_image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.dockerhub_image }}:latest
+            ${{ steps.meta.outputs.dockerhub_image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.dockerhub_image }}:${{ steps.meta.outputs.version }}
+
+      - name: Confirm push success
+        run: |
+          echo "Image pushed to Docker Hub:"
+          echo "  ${{ steps.meta.outputs.dockerhub_image }}:latest"
+          echo "  ${{ steps.meta.outputs.dockerhub_image }}:${{ steps.meta.outputs.tag }}"
+          echo "  ${{ steps.meta.outputs.dockerhub_image }}:${{ steps.meta.outputs.version }}"
 
   # ---------------------------------------------------------
-  # Deploy to STAGING automatically after image is pushed
+  # STAGE 3: Deploy to STAGING by PULLING the image FROM
+  # Docker Hub (not a local build) and running it together
+  # with an MQTT broker, then verify both work.
   # ---------------------------------------------------------
   deploy-staging:
-    name: Deploy to Staging
+    name: Deploy to Staging (from Docker Hub)
     runs-on: ubuntu-latest
     needs: build-and-push
     environment:
@@ -87,22 +140,68 @@ jobs:
       url: http://staging.bodaconnect.local
 
     steps:
-      - name: Deploy to staging server
-        run: |
-          echo "Deploying image ${{ needs.build-and-push.outputs.image }}:${{ needs.build-and-push.outputs.image_tag }} to STAGING"
-          echo "Example real command:"
-          echo "ssh user@staging-server 'docker pull ${{ needs.build-and-push.outputs.image }}:latest && docker compose -f docker-compose.staging.yml up -d'"
+      - uses: actions/checkout@v4
 
-      - name: Verify staging is running
+      - name: Pull image from Docker Hub
+        run: docker pull ${{ needs.build-and-push.outputs.dockerhub_image }}:latest
+
+      - name: Start MQTT broker + application (staging simulation)
         run: |
-          echo "Checking staging health endpoint..."
-          echo "curl -f http://staging-server:5000/api/health"
-          echo "Staging deployment verified."
+          docker network create boda-staging-net
+          docker run -d --name staging-mqtt --network boda-staging-net -p 1884:1883 eclipse-mosquitto:2
+          sleep 2
+          docker exec staging-mqtt sh -c \
+            "echo 'listener 1883' > /mosquitto/config/mosquitto.conf && \
+             echo 'allow_anonymous true' >> /mosquitto/config/mosquitto.conf"
+          docker restart staging-mqtt
+          sleep 2
+          docker run -d --name staging-app --network boda-staging-net -p 5001:5000 \
+            -e MQTT_BROKER_HOST=staging-mqtt -e MQTT_BROKER_PORT=1883 \
+            ${{ needs.build-and-push.outputs.dockerhub_image }}:latest
+          sleep 3
+
+      - name: Verify staging app is running
+        run: |
+          curl -f http://localhost:5001/api/health
+          echo "Staging deployment verified - app is running from Docker Hub image."
+
+      - name: Verify MQTT works on staging (publish -> subscribe)
+        run: |
+          pip install paho-mqtt==1.6.1
+          python - << 'PYEOF'
+          import paho.mqtt.client as mqtt
+          import json, time, threading
+
+          received = []
+
+          def on_message(client, userdata, msg):
+              received.append(json.loads(msg.payload.decode()))
+
+          sub = mqtt.Client()
+          sub.on_message = on_message
+          sub.connect("localhost", 1884, 60)
+          sub.subscribe("ride/request")
+          threading.Thread(target=sub.loop_forever, daemon=True).start()
+
+          time.sleep(1)
+
+          pub = mqtt.Client()
+          pub.connect("localhost", 1884, 60)
+          pub.publish("ride/request", json.dumps({"trip_id": 1, "pickup": "Test", "destination": "Test"}))
+
+          time.sleep(2)
+          assert len(received) == 1, "MQTT message was not received on staging!"
+          print("MQTT publish -> subscribe verified on staging.")
+          PYEOF
+
+      - name: Clean up staging containers
+        if: always()
+        run: |
+          docker rm -f staging-app staging-mqtt || true
+          docker network rm boda-staging-net || true
 
   # ---------------------------------------------------------
-  # Manual approval gate - Release Manager must approve
-  # This pauses the pipeline until someone approves the
-  # 'production' environment in GitHub's Environments settings
+  # STAGE 4: Manual approval gate - Release Manager decision
   # ---------------------------------------------------------
   approval-gate:
     name: Release Manager Approval
@@ -116,10 +215,11 @@ jobs:
         run: echo "Release Manager approved deployment to PRODUCTION."
 
   # ---------------------------------------------------------
-  # Deploy to PRODUCTION after manual approval
+  # STAGE 5: Deploy to PRODUCTION - pull versioned image from
+  # Docker Hub and run it (simulated production server)
   # ---------------------------------------------------------
   deploy-production:
-    name: Deploy to Production
+    name: Deploy to Production (from Docker Hub)
     runs-on: ubuntu-latest
     needs: [build-and-push, approval-gate]
     environment:
@@ -127,14 +227,40 @@ jobs:
       url: http://bodaconnect.example.com
 
     steps:
-      - name: Deploy to production server
+      - name: Pull versioned image from Docker Hub
         run: |
-          echo "Deploying image ${{ needs.build-and-push.outputs.image }}:${{ needs.build-and-push.outputs.image_tag }} to PRODUCTION"
-          echo "Example real command:"
-          echo "ssh user@prod-server 'docker pull ${{ needs.build-and-push.outputs.image }}:latest && docker compose -f docker-compose.prod.yml up -d'"
+          docker pull ${{ needs.build-and-push.outputs.dockerhub_image }}:${{ needs.build-and-push.outputs.version_tag }}
 
-      - name: Verify production is running
+      - name: Start MQTT broker + application (production simulation)
         run: |
-          echo "Checking production health endpoint..."
-          echo "curl -f http://prod-server:5000/api/health"
-          echo "Production deployment verified and system is running."
+          docker network create boda-prod-net
+          docker run -d --name prod-mqtt --network boda-prod-net -p 1885:1883 eclipse-mosquitto:2
+          sleep 2
+          docker exec prod-mqtt sh -c \
+            "echo 'listener 1883' > /mosquitto/config/mosquitto.conf && \
+             echo 'allow_anonymous true' >> /mosquitto/config/mosquitto.conf"
+          docker restart prod-mqtt
+          sleep 2
+          docker run -d --name prod-app --network boda-prod-net -p 5002:5000 \
+            -e MQTT_BROKER_HOST=prod-mqtt -e MQTT_BROKER_PORT=1883 \
+            ${{ needs.build-and-push.outputs.dockerhub_image }}:${{ needs.build-and-push.outputs.version_tag }}
+          sleep 3
+
+      - name: Verify production app is running
+        run: |
+          curl -f http://localhost:5002/api/health
+          echo "Production deployment verified - running version ${{ needs.build-and-push.outputs.version_tag }} from Docker Hub."
+
+      - name: Smoke test - request a ride end to end
+        run: |
+          curl -f -X POST http://localhost:5002/api/request-ride \
+            -H "Content-Type: application/json" \
+            -d '{"customer_name":"CI Test","pickup":"Nyerere Square","destination":"Stadium"}'
+          echo ""
+          echo "Production system is processing requests correctly."
+
+      - name: Clean up production containers
+        if: always()
+        run: |
+          docker rm -f prod-app prod-mqtt || true
+          docker network rm boda-prod-net || true

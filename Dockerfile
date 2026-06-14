@@ -18,8 +18,6 @@ COPY backend/ .
 # Copy the React build output into Flask's static folder
 COPY --from=frontend-build /app/frontend/dist ./static
 
-ENV PYTHONUNBUFFERED=1
-
 EXPOSE 5000
 
 CMD ["python", "app.py"]
