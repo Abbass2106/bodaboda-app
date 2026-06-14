@@ -125,7 +125,7 @@ jobs:
           echo "  ${{ steps.meta.outputs.dockerhub_image }}:latest"
           echo "  ${{ steps.meta.outputs.dockerhub_image }}:${{ steps.meta.outputs.tag }}"
           echo "  ${{ steps.meta.outputs.dockerhub_image }}:${{ steps.meta.outputs.version }}"
-          aa
+          
 
   # ---------------------------------------------------------
   # STAGE 3: Deploy to STAGING by PULLING the image FROM
