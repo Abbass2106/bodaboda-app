@@ -13,7 +13,6 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/bodaboda-app
 
 jobs:
   # ---------------------------------------------------------
@@ -84,11 +83,13 @@ jobs:
 
       - name: Compute image metadata
         id: meta
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           echo "tag=$(echo ${GITHUB_SHA} | cut -c1-7)" >> "$GITHUB_OUTPUT"
           echo "version=${{ inputs.version_tag || 'v1.0' }}" >> "$GITHUB_OUTPUT"
           echo "ghcr_image=$(echo ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-          echo "dockerhub_image=$(echo ${{ env.DOCKERHUB_IMAGE }} | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "dockerhub_image=$(echo ${DOCKERHUB_USERNAME}/bodaboda-app | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -125,7 +126,6 @@ jobs:
           echo "  ${{ steps.meta.outputs.dockerhub_image }}:latest"
           echo "  ${{ steps.meta.outputs.dockerhub_image }}:${{ steps.meta.outputs.tag }}"
           echo "  ${{ steps.meta.outputs.dockerhub_image }}:${{ steps.meta.outputs.version }}"
-          
 
   # ---------------------------------------------------------
   # STAGE 3: Deploy to STAGING by PULLING the image FROM
@@ -185,7 +185,6 @@ jobs:
           threading.Thread(target=sub.loop_forever, daemon=True).start()
 
           time.sleep(1)
-          
 
           pub = mqtt.Client()
           pub.connect("localhost", 1884, 60)
