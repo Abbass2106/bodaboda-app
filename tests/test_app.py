@@ -25,7 +25,7 @@ def test_request_ride_success(client):
     response = client.post(
         "/api/request-ride",
         json={
-            "customer_name": "Anna",
+            "customer_name": "Asha",
             "pickup": "Nyerere Square",
             "destination": "Dodoma Stadium",
         },
@@ -39,7 +39,7 @@ def test_request_ride_success(client):
 def test_request_ride_missing_fields(client):
     response = client.post(
         "/api/request-ride",
-        json={"customer_name": "Anna"},
+        json={"customer_name": "Asha"},
     )
     assert response.status_code == 400
 

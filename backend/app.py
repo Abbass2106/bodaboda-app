@@ -1,10 +1,38 @@
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 import os
+import json
 from datetime import datetime
+import paho.mqtt.client as mqtt
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
+
+# ---------------------------------------------------------------
+# MQTT setup
+# ---------------------------------------------------------------
+MQTT_BROKER = os.environ.get("MQTT_BROKER_HOST", "localhost")
+MQTT_PORT = int(os.environ.get("MQTT_BROKER_PORT", 1883))
+
+mqtt_client = mqtt.Client(client_id="bodaconnect-backend")
+mqtt_connected = False
+
+try:
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+    mqtt_client.loop_start()
+    mqtt_connected = True
+except Exception as e:
+    print(f"[MQTT] Could not connect to broker at {MQTT_BROKER}:{MQTT_PORT} -> {e}")
+
+
+def mqtt_publish(topic, payload: dict):
+    """Publish a JSON message to an MQTT topic. Fails silently if broker is down."""
+    try:
+        mqtt_client.publish(topic, json.dumps(payload))
+        print(f"[MQTT] Published to {topic}: {payload}")
+    except Exception as e:
+        print(f"[MQTT] Publish failed: {e}")
+
 
 # In-memory "database" (simple lists, good enough for a student project)
 trips = []
@@ -13,7 +41,11 @@ trip_counter = 1
 
 @app.route("/api/health")
 def health():
-    return jsonify({"status": "ok", "message": "BodaConnect API is running"})
+    return jsonify({
+        "status": "ok",
+        "message": "BodaConnect API is running",
+        "mqtt_connected": mqtt_connected,
+    })
 
 
 @app.route("/api/request-ride", methods=["POST"])
@@ -41,6 +73,15 @@ def request_ride():
     trips.append(trip)
     trip_counter += 1
 
+    # Broadcast new ride request to subscribed riders
+    mqtt_publish("ride/request", {
+        "trip_id": trip["id"],
+        "customer_name": trip["customer_name"],
+        "pickup": trip["pickup"],
+        "destination": trip["destination"],
+        "status": trip["status"],
+    })
+
     return jsonify({"message": "Ride requested successfully", "trip": trip}), 201
 
 
@@ -62,6 +103,13 @@ def assign_trip(trip_id):
         if t["id"] == trip_id:
             t["rider"] = rider_name
             t["status"] = "assigned"
+
+            mqtt_publish("ride/status", {
+                "trip_id": t["id"],
+                "status": "accepted",
+                "rider": rider_name,
+            })
+
             return jsonify({"message": "Trip assigned", "trip": t})
 
     return jsonify({"error": "Trip not found"}), 404
@@ -76,6 +124,14 @@ def complete_trip(trip_id):
         if t["id"] == trip_id:
             t["status"] = "completed"
             t["fare"] = fare
+
+            mqtt_publish("ride/status", {
+                "trip_id": t["id"],
+                "status": "completed",
+                "rider": t["rider"],
+                "fare": fare,
+            })
+
             return jsonify({"message": "Trip completed", "trip": t})
 
     return jsonify({"error": "Trip not found"}), 404
