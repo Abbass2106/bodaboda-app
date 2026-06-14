@@ -84,7 +84,7 @@ jobs:
       - name: Compute image metadata
         id: meta
         env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
         run: |
           echo "tag=$(echo ${GITHUB_SHA} | cut -c1-7)" >> "$GITHUB_OUTPUT"
           echo "version=${{ inputs.version_tag || 'v1.0' }}" >> "$GITHUB_OUTPUT"
@@ -274,4 +274,3 @@ jobs:
           docker network rm boda-prod-net || true
 
 
-          
