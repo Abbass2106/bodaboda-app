@@ -265,3 +265,52 @@ jobs:
         run: |
           docker rm -f prod-app prod-mqtt || true
           docker network rm boda-prod-net || true
+
+  # ---------------------------------------------------------
+  # IMPROVEMENT 3: Automated rollback mechanism
+  # If deploy-production fails (health check or smoke test
+  # fails), automatically pull and run the previous "latest"
+  # known-good image instead of leaving production broken.
+  # ---------------------------------------------------------
+  rollback-production:
+    name: Rollback Production (on failure)
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-production]
+    if: failure() && needs.deploy-production.result == 'failure'
+    environment:
+      name: production
+
+    steps:
+      - name: Roll back to previous stable image
+        run: |
+          echo "Production deployment FAILED for version ${{ needs.build-and-push.outputs.version_tag }}."
+          echo "Rolling back to last known-good image: ${{ needs.build-and-push.outputs.dockerhub_image }}:latest"
+          docker pull ${{ needs.build-and-push.outputs.dockerhub_image }}:latest || echo "Pull failed - manual intervention required."
+
+      - name: Restart production with previous stable image
+        run: |
+          docker network create boda-prod-net || true
+          docker rm -f prod-app prod-mqtt 2>/dev/null || true
+          docker run -d --name prod-mqtt --network boda-prod-net -p 1885:1883 eclipse-mosquitto:2
+          sleep 2
+          docker exec prod-mqtt sh -c \
+            "echo 'listener 1883' > /mosquitto/config/mosquitto.conf && \
+             echo 'allow_anonymous true' >> /mosquitto/config/mosquitto.conf"
+          docker restart prod-mqtt
+          sleep 2
+          docker run -d --name prod-app --network boda-prod-net -p 5002:5000 \
+            -e MQTT_BROKER_HOST=prod-mqtt -e MQTT_BROKER_PORT=1883 \
+            ${{ needs.build-and-push.outputs.dockerhub_image }}:latest
+          sleep 3
+          curl -f http://localhost:5002/api/health
+          echo "Rollback complete - production restored to previous stable version."
+
+      - name: Notify rollback occurred
+        run: |
+          echo "ROLLBACK EXECUTED on production. Investigate version ${{ needs.build-and-push.outputs.version_tag }} before retrying."
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker rm -f prod-app prod-mqtt || true
+          docker network rm boda-prod-net || true

@@ -31,12 +31,38 @@ jobs:
             eclipse-mosquitto:2
           sleep 3
 
-      - name: Run tests
+      # ---------------------------------------------------------
+      # IMPROVEMENT 1: Test coverage reporting
+      # Generates a coverage % and a viewable HTML report as a
+      # pipeline artifact, instead of only pass/fail results.
+      # ---------------------------------------------------------
+      - name: Run tests with coverage
         env:
           MQTT_BROKER_HOST: localhost
           MQTT_BROKER_PORT: 1883
         run: |
-          python -m pytest tests/ -v
+          python -m pytest tests/ -v --cov=backend --cov-report=term-missing --cov-report=html --cov-report=xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: htmlcov/
+
+      # ---------------------------------------------------------
+      # IMPROVEMENT 2: Automated failure notification
+      # Posts a message whenever the test job fails, instead of
+      # someone having to notice manually on GitHub.
+      # ---------------------------------------------------------
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "CI FAILED on branch ${{ github.ref_name }} (commit ${{ github.sha }})"
+          echo "Would notify Slack/email here via webhook:"
+          echo "curl -X POST -H 'Content-Type: application/json' -d '{\"text\":\"CI failed on ${{ github.ref_name }}\"}' \$SLACK_WEBHOOK_URL"
+          # Real usage: store SLACK_WEBHOOK_URL as a repo secret and
+          # uncomment the curl line above to post to an actual Slack channel.
 
   build:
     name: Build Docker Image
@@ -57,3 +83,7 @@ jobs:
           file: ./Dockerfile
           push: false
           tags: bodaboda-app:latest
+
+      - name: Notify on build failure
+        if: failure()
+        run: echo "BUILD FAILED on ${{ github.ref_name }} - would notify Slack/email here."
